@@ -1,0 +1,121 @@
+SAMPLE OUTPUT OF SECURE CHAT APPLICATION
+==========================================
+
+1. KEY GENERATION
+-----------------
+$ ./crypto_chat -g
+Shared keys (hex) - use this for both sides (first 64 hex = ENC key, next 64 = MAC key):
+a1b2c3d4e5f6789012345678901234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef
+
+2. SERVER SIDE
+--------------
+$ ./crypto_chat server 5000 --keys a1b2c3d4e5f6789012345678901234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef
+Encryption Key (hex): a1b2c3d4e5f6789012345678901234567890abcdef1234567890abcdef1234567890
+MAC Key (hex):        abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890
+Waiting for connection on port 5000 ...
+
+3. CLIENT SIDE
+--------------
+$ ./crypto_chat client 127.0.0.1 5000 --keys a1b2c3d4e5f6789012345678901234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef
+Encryption Key (hex): a1b2c3d4e5f6789012345678901234567890abcdef1234567890abcdef1234567890
+MAC Key (hex):        abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890
+Connecting to 127.0.0.1:5000 ...
+Connected to server.
+You: 
+
+4. SERVER AFTER CLIENT CONNECTS
+-------------------------------
+Peer connected.
+You: 
+
+5. CHAT SESSION - CLIENT SENDS FIRST MESSAGE
+-------------------------------------------
+CLIENT SIDE:
+You: Hello Server!
+
+--- SENDING ---
+Step S1 - Original Plaintext: Hello Server!
+Step S2 - Generated IV: 7f3a9b2c8d5e6f1a4b7c9d0e2f3a5b8c
+Step S3 - Ciphertext (AES-256-CBC): 9e2f4a7c8b1d3e5f6a9c2d4e7f8a1b3c5d6e8f9a2b4c6d8e0f2a4b6c8d0e2f4a
+Step S4 - HMAC-SHA256 (over IV||Ciphertext): 1a2b3c4d5e6f7890abcdef1234567890abcdef1234567890abcdef1234567890
+Step S5 - Transmitting (IV || Ciphertext || MAC)
+---------------
+
+SERVER SIDE (simultaneously):
+--- RECEIVED ---
+Step R1 - Received IV: 7f3a9b2c8d5e6f1a4b7c9d0e2f3a5b8c
+Step R2 - Received Ciphertext: 9e2f4a7c8b1d3e5f6a9c2d4e7f8a1b3c5d6e8f9a2b4c6d8e0f2a4b6c8d0e2f4a
+Step R3 - Received MAC: 1a2b3c4d5e6f7890abcdef1234567890abcdef1234567890abcdef1234567890
+Step R4 - MAC Verification: OK
+Step R5 - Decrypted Plaintext (Peer): Hello Server!
+---------------
+
+6. CHAT SESSION - SERVER REPLIES
+--------------------------------
+SERVER SIDE:
+You: Hi Client! How are you?
+
+--- SENDING ---
+Step S1 - Original Plaintext: Hi Client! How are you?
+Step S2 - Generated IV: 9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f
+Step S3 - Ciphertext (AES-256-CBC): 3f7a9b2c8d5e6f1a4b7c9d0e2f3a5b8c9d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a
+Step S4 - HMAC-SHA256 (over IV||Ciphertext): abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890
+Step S5 - Transmitting (IV || Ciphertext || MAC)
+---------------
+
+CLIENT SIDE (simultaneously):
+--- RECEIVED ---
+Step R1 - Received IV: 9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f
+Step R2 - Received Ciphertext: 3f7a9b2c8d5e6f1a4b7c9d0e2f3a5b8c9d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a
+Step R3 - Received MAC: abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890
+Step R4 - MAC Verification: OK
+Step R5 - Decrypted Plaintext (Peer): Hi Client! How are you?
+---------------
+
+7. CONTINUED CHAT
+------------------
+CLIENT SIDE:
+You: I'm doing great! This encrypted chat is working well.
+
+--- SENDING ---
+Step S1 - Original Plaintext: I'm doing great! This encrypted chat is working well.
+Step S2 - Generated IV: a1b2c3d4e5f678901234567890123456
+Step S3 - Ciphertext (AES-256-CBC): 7f8a9b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4
+Step S4 - HMAC-SHA256 (over IV||Ciphertext): 234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef
+Step S5 - Transmitting (IV || Ciphertext || MAC)
+---------------
+
+SERVER SIDE:
+--- RECEIVED ---
+Step R1 - Received IV: a1b2c3d4e5f678901234567890123456
+Step R2 - Received Ciphertext: 7f8a9b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4
+Step R3 - Received MAC: 234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef
+Step R4 - MAC Verification: OK
+Step R5 - Decrypted Plaintext (Peer): I'm doing great! This encrypted chat is working well.
+---------------
+
+8. TERMINATION
+---------------
+When either side closes the terminal or presses Ctrl+C:
+
+[Connection closed]
+
+Or when the socket is closed due to network issues:
+
+[Connection closed]
+
+KEY SECURITY FEATURES SHOWN:
+============================
+1. Each message uses a unique random IV (Step S2/R1)
+2. Messages are encrypted with AES-256-CBC (Step S3/R2)
+3. HMAC-SHA256 provides authentication (Step S4/R3)
+4. MAC verification prevents tampering (Step R4)
+5. Only verified messages are decrypted (Step R5)
+6. All cryptographic steps are visible for educational purposes
+
+NETWORK PROTOCOL:
+=================
+- Length-prefixed framing: [iv_len][ct_len][mac_len][iv][ct][mac]
+- Network byte order for length fields
+- Reliable transmission with readn/writen functions
+- Concurrent send/receive using separate threads

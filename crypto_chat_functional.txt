@@ -1,0 +1,380 @@
+CODE COLUMN	EXPLANATION COLUMN
+----------------------------------------------------------------------------------------------------
+// crypto_chat.c	// Duplex CLI chat: AES-256-CBC (encrypt-then-mac) + HMAC-SHA256
+// Compile: gcc -O2 crypto_chat.c -o crypto_chat -lssl -lcrypto -lpthread	// Usage:
+// 1) generate keys:   ./crypto_chat -g	
+// 2) server:          ./crypto_chat server <port> --keys <hex_64bytes>
+// 3) client:          ./crypto_chat client <host> <port> --keys <hex_64bytes>	
+
+#define _POSIX_C_SOURCE 200809L	// Define POSIX standard for compatibility
+#include <stdio.h>	// Standard I/O operations
+#include <stdlib.h>	// Memory allocation and process control
+#include <string.h>	// String manipulation
+#include <stdint.h>	// Standard integer types
+#include <unistd.h>	// System calls
+#include <arpa/inet.h>	// Network functions
+#include <pthread.h>	// Threading support
+#include <errno.h>	// Error handling
+#include <openssl/evp.h>	// OpenSSL high-level crypto
+#include <openssl/hmac.h>	// HMAC functions
+#include <openssl/rand.h>	// Cryptographically secure random
+#include <openssl/err.h>	// OpenSSL error handling
+
+#define AES_KEYLEN 32	// AES-256 key length (32 bytes)
+#define HMAC_KEYLEN 32	// HMAC-SHA256 key length (32 bytes)
+#define IV_LEN 16	// AES-CBC IV length (16 bytes)
+#define HMAC_LEN 32	// HMAC-SHA256 output length (32 bytes)
+
+// UTILITY FUNCTIONS SECTION
+----------------------------------------------------------------------------------------------------
+static void hexdump_label(const char *label, const unsigned char *b, size_t n) {
+    printf("%s", label);
+    for (size_t i = 0; i < n; ++i) printf("%02x", b[i]);
+    printf("\n");
+}	// Function: hexdump_label
+// Purpose: Prints binary data as hexadecimal with a descriptive label
+// Used for debugging and showing cryptographic steps
+
+static unsigned char *hex2bin(const char *hex, size_t *outlen) {
+    size_t len = strlen(hex);
+    if (len % 2) return NULL;
+    *outlen = len/2;
+    unsigned char *buf = malloc(*outlen);
+    for (size_t i=0;i<*outlen;i++){
+        unsigned int v;
+        if (sscanf(hex+2*i, "%2x", &v) != 1) { free(buf); return NULL; }
+        buf[i] = (unsigned char)v;
+    }
+    return buf;
+}	// Function: hex2bin
+// Purpose: Converts hexadecimal string to binary data
+// Returns allocated memory that must be freed by caller
+// Validates even length and proper hex format
+
+static char *bin2hex(const unsigned char *buf, size_t len) {
+    char *s = malloc(len*2 + 1);
+    for (size_t i=0;i<len;i++) sprintf(s+2*i, "%02x", buf[i]);
+    s[len*2]=0;
+    return s;
+}	// Function: bin2hex
+// Purpose: Converts binary data to hexadecimal string
+// Returns allocated memory that must be freed by caller
+// Used for displaying keys in human-readable format
+
+static int writen(int fd, const void *buf, size_t n) {
+    const uint8_t *p = buf;
+    size_t left = n;
+    while (left) {
+        ssize_t w = write(fd, p, left);
+        if (w <= 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        left -= w; p += w;
+    }
+    return 0;
+}	// Function: writen
+// Purpose: Writes exactly n bytes to file descriptor
+// Handles partial writes and signal interruptions
+// Used for reliable network transmission
+
+static int readn(int fd, void *buf, size_t n) {
+    uint8_t *p = buf;
+    size_t left = n;
+    while (left) {
+        ssize_t r = read(fd, p, left);
+        if (r <= 0) {
+            if (r == 0) return 1;
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        left -= r; p += r;
+    }
+    return 0;
+}	// Function: readn
+// Purpose: Reads exactly n bytes from file descriptor
+// Handles partial reads and signal interruptions
+// Returns 1 on EOF, -1 on error, 0 on success
+
+// CRYPTOGRAPHIC FUNCTIONS SECTION
+----------------------------------------------------------------------------------------------------
+static int aes_encrypt(const unsigned char *pt, int pt_len,
+                       const unsigned char *key, const unsigned char *iv,
+                       unsigned char **out, int *out_len) {
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) return -1;
+    int len=0, ciphertext_len=0;
+    *out = malloc(pt_len + EVP_CIPHER_block_size(EVP_aes_256_cbc()));
+    if (!*out) { EVP_CIPHER_CTX_free(ctx); return -1; }
+    if (1 != EVP_EncryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, key, iv)) goto fail;
+    if (1 != EVP_EncryptUpdate(ctx, *out, &len, pt, pt_len)) goto fail;
+    ciphertext_len = len;
+    if (1 != EVP_EncryptFinal_ex(ctx, *out + len, &len)) goto fail;
+    ciphertext_len += len;
+    *out_len = ciphertext_len;
+    EVP_CIPHER_CTX_free(ctx);
+    return 0;
+fail:
+    EVP_CIPHER_CTX_free(ctx);
+    free(*out);
+    *out = NULL;
+    return -1;
+}	// Function: aes_encrypt
+// Purpose: Encrypts plaintext using AES-256-CBC
+// Input: plaintext, key, and IV
+// Output: allocated ciphertext buffer
+// Uses OpenSSL EVP interface for proper padding
+
+static int aes_decrypt(const unsigned char *ct, int ct_len,
+                       const unsigned char *key, const unsigned char *iv,
+                       unsigned char **out, int *out_len) {
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) return -1;
+    int len=0, pt_len=0;
+    *out = malloc(ct_len + EVP_CIPHER_block_size(EVP_aes_256_cbc()));
+    if (!*out) { EVP_CIPHER_CTX_free(ctx); return -1; }
+    if (1 != EVP_DecryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, key, iv)) goto fail;
+    if (1 != EVP_DecryptUpdate(ctx, *out, &len, ct, ct_len)) goto fail;
+    pt_len = len;
+    if (1 != EVP_DecryptFinal_ex(ctx, *out + len, &len)) goto fail;
+    pt_len += len;
+    *out_len = pt_len;
+    EVP_CIPHER_CTX_free(ctx);
+    return 0;
+fail:
+    EVP_CIPHER_CTX_free(ctx);
+    free(*out);
+    *out = NULL;
+    return -1;
+}	// Function: aes_decrypt
+// Purpose: Decrypts ciphertext using AES-256-CBC
+// Input: ciphertext, key, and IV
+// Output: allocated plaintext buffer
+// Handles padding removal automatically
+
+static int compute_hmac(const unsigned char *mac_key, size_t mac_key_len,
+                        const unsigned char *iv, size_t iv_len,
+                        const unsigned char *ct, size_t ct_len,
+                        unsigned char *out) {
+    unsigned int len = 0;
+    HMAC_CTX *h = HMAC_CTX_new();
+    if (!h) return -1;
+    if (1 != HMAC_Init_ex(h, mac_key, (int)mac_key_len, EVP_sha256(), NULL)) goto fail;
+    if (1 != HMAC_Update(h, iv, iv_len)) goto fail;
+    if (1 != HMAC_Update(h, ct, ct_len)) goto fail;
+    if (1 != HMAC_Final(h, out, &len)) goto fail;
+    HMAC_CTX_free(h);
+    return 0;
+fail:
+    HMAC_CTX_free(h);
+    return -1;
+}	// Function: compute_hmac
+// Purpose: Computes HMAC-SHA256 over IV concatenated with ciphertext
+// Implements encrypt-then-MAC pattern for security
+// Provides message authentication and integrity
+
+// NETWORK PROTOCOL FUNCTIONS SECTION
+----------------------------------------------------------------------------------------------------
+static int send_frame(int sock, const unsigned char *iv, int ivlen,
+                      const unsigned char *ct, int ctlen,
+                      const unsigned char *mac, int maclen) {
+    uint32_t a = htonl(ivlen), b = htonl(ctlen), c = htonl(maclen);
+    if (writen(sock, &a, 4)) return -1;
+    if (writen(sock, &b, 4)) return -1;
+    if (writen(sock, &c, 4)) return -1;
+    if (writen(sock, iv, ivlen)) return -1;
+    if (writen(sock, ct, ctlen)) return -1;
+    if (writen(sock, mac, maclen)) return -1;
+    return 0;
+}	// Function: send_frame
+// Purpose: Sends encrypted message with length prefixes
+// Protocol: [iv_len][ct_len][mac_len][iv][ct][mac]
+// Uses network byte order for lengths
+
+static int recv_frame(int sock,
+                      unsigned char **iv, int *ivlen,
+                      unsigned char **ct, int *ctlen,
+                      unsigned char **mac, int *maclen) {
+    uint32_t a,b,c;
+    if (readn(sock, &a, 4)) return -1;
+    if (readn(sock, &b, 4)) return -1;
+    if (readn(sock, &c, 4)) return -1;
+    *ivlen = ntohl(a); *ctlen = ntohl(b); *maclen = ntohl(c);
+    *iv = malloc(*ivlen); *ct = malloc(*ctlen); *mac = malloc(*maclen);
+    if (!*iv || !*ct || !*mac) return -1;
+    if (readn(sock, *iv, *ivlen)) return -1;
+    if (readn(sock, *ct, *ctlen)) return -1;
+    if (readn(sock, *mac, *maclen)) return -1;
+    return 0;
+}	// Function: recv_frame
+// Purpose: Receives encrypted message with length prefixes
+// Allocates memory for IV, ciphertext, and MAC
+// Caller must free allocated buffers
+
+// GLOBAL VARIABLES AND THREAD STRUCTURE
+----------------------------------------------------------------------------------------------------
+static unsigned char ENC_KEY[AES_KEYLEN];	// Global AES-256 encryption key
+static unsigned char MAC_KEY[HMAC_KEYLEN];	// Global HMAC-SHA256 key
+typedef struct { int sock; } thrarg_t;	// Thread argument structure
+
+// THREAD FUNCTIONS SECTION
+----------------------------------------------------------------------------------------------------
+static void *receiver_thread(void *arg) {
+    int s = ((thrarg_t*)arg)->sock;
+    while (1) {
+        unsigned char *iv=NULL, *ct=NULL, *mac=NULL;
+        int ivlen=0, ctlen=0, maclen=0;
+        if (recv_frame(s, &iv, &ivlen, &ct, &ctlen, &mac, &maclen) != 0) {
+            printf("\n[Connection closed]\n"); exit(0);
+        }
+        printf("\n--- RECEIVED ---\n");
+        hexdump_label("Step R1 - Received IV: ", iv, ivlen);
+        hexdump_label("Step R2 - Received Ciphertext: ", ct, ctlen);
+        hexdump_label("Step R3 - Received MAC: ", mac, maclen);
+        unsigned char expected[HMAC_LEN];
+        if (compute_hmac(MAC_KEY, HMAC_KEYLEN, iv, ivlen, ct, ctlen, expected) != 0) {
+            printf("Error computing HMAC on receiver\n");
+        } else {
+            int ok = (CRYPTO_memcmp(expected, mac, maclen) == 0);
+            printf("Step R4 - MAC Verification: %s\n", ok ? "OK" : "FAILED");
+            if (ok) {
+                unsigned char *pt = NULL; int ptlen = 0;
+                if (aes_decrypt(ct, ctlen, ENC_KEY, iv, &pt, &ptlen) == 0) {
+                    printf("Step R5 - Decrypted Plaintext (Peer): %.*s\n", ptlen, pt);
+                    free(pt);
+                } else {
+                    printf("Decryption failed\n");
+                }
+            } else {
+                printf("Rejecting message due to MAC mismatch.\n");
+            }
+        }
+        free(iv); free(ct); free(mac);
+        printf("---------------\n");
+        fflush(stdout);
+    }
+    return NULL;
+}	// Function: receiver_thread
+// Purpose: Continuously receives and decrypts messages from peer
+// Implements receive-side of encrypt-then-MAC protocol
+// Verifies MAC before decryption for security
+// Runs in infinite loop until connection closed
+
+static void *sender_thread(void *arg) {
+    int s = ((thrarg_t*)arg)->sock;
+    char *line = NULL;
+    size_t cap = 0;
+    while (1) {
+        printf("You: ");
+        fflush(stdout);
+        ssize_t nread = getline(&line, &cap, stdin);
+        if (nread <= 0) continue;
+        while (nread>0 && (line[nread-1]=='\n' || line[nread-1]=='\r')) { line[nread-1]=0; nread--; }
+        if (nread==0) continue;
+        printf("\n--- SENDING ---\n");
+        printf("Step S1 - Original Plaintext: %s\n", line);
+        unsigned char iv[IV_LEN];
+        if (RAND_bytes(iv, IV_LEN) != 1) { fprintf(stderr,"RAND failed\n"); exit(1); }
+        hexdump_label("Step S2 - Generated IV: ", iv, IV_LEN);
+        unsigned char *ct = NULL; int ctlen = 0;
+        if (aes_encrypt((unsigned char*)line, (int)nread, ENC_KEY, iv, &ct, &ctlen) != 0) {
+            fprintf(stderr,"Encryption failed\n"); exit(1);
+        }
+        hexdump_label("Step S3 - Ciphertext (AES-256-CBC): ", ct, ctlen);
+        unsigned char mac[HMAC_LEN];
+        if (compute_hmac(MAC_KEY, HMAC_KEYLEN, iv, IV_LEN, ct, ctlen, mac) != 0) {
+            fprintf(stderr,"HMAC failed\n"); exit(1);
+        }
+        hexdump_label("Step S4 - HMAC-SHA256 (over IV||Ciphertext): ", mac, HMAC_LEN);
+        printf("Step S5 - Transmitting (IV || Ciphertext || MAC)\n");
+        if (send_frame(s, iv, IV_LEN, ct, ctlen, mac, HMAC_LEN) != 0) {
+            fprintf(stderr,"Send failed\n"); exit(1);
+        }
+        free(ct);
+        printf("---------------\n");
+    }
+    return NULL;
+}	// Function: sender_thread
+// Purpose: Continuously reads user input, encrypts, and sends messages
+// Implements send-side of encrypt-then-MAC protocol
+// Generates random IV for each message
+// Shows cryptographic steps for educational purposes
+
+// MAIN FUNCTION SECTION
+----------------------------------------------------------------------------------------------------
+int main(int argc, char **argv) {
+    OpenSSL_add_all_algorithms();
+    ERR_load_crypto_strings();
+    if (argc==2 && strcmp(argv[1], "-g")==0) {
+        unsigned char keypair[AES_KEYLEN + HMAC_KEYLEN];
+        if (RAND_bytes(keypair, sizeof(keypair)) != 1) { fprintf(stderr,"RAND failed\n"); return 1;}
+        char *hex = bin2hex(keypair, sizeof(keypair));
+        printf("Shared keys (hex) - use this for both sides (first 64 hex = ENC key, next 64 = MAC key):\n%s\n", hex);
+        free(hex);
+        return 0;
+    }
+    if (argc < 3) {
+        fprintf(stderr,"Usage:\n  %s -g\n  %s server <port> --keys <hex_64bytes>\n  %s client <host> <port> --keys <hex_64bytes>\n", argv[0], argv[0], argv[0]);
+        return 1;
+    }
+    int mode_server = 0, mode_client = 0;
+    char *host = NULL; int port = 0; char *keys_hex = NULL;
+    if (strcmp(argv[1], "server")==0) {
+        mode_server = 1; port = atoi(argv[2]);
+        for (int i=3;i<argc;i++) if (strcmp(argv[i],"--keys")==0 && i+1<argc) { keys_hex = argv[i+1]; i++; }
+    } else if (strcmp(argv[1], "client")==0) {
+        mode_client = 1; host = argv[2]; port = atoi(argv[3]);
+        for (int i=4;i<argc;i++) if (strcmp(argv[i],"--keys")==0 && i+1<argc) { keys_hex = argv[i+1]; i++; }
+    } else {
+        fprintf(stderr,"Invalid mode\n"); return 1;
+    }
+    if (!keys_hex) { fprintf(stderr,"--keys <hex_64bytes> is required (use -g to generate)\n"); return 1; }
+    size_t klen = 0;
+    unsigned char *kp = hex2bin(keys_hex, &klen);
+    if (!kp || klen != (AES_KEYLEN + HMAC_KEYLEN)) { fprintf(stderr,"Invalid keys length\n"); return 1; }
+    memcpy(ENC_KEY, kp, AES_KEYLEN);
+    memcpy(MAC_KEY, kp + AES_KEYLEN, HMAC_KEYLEN);
+    free(kp);
+    char *ehex = bin2hex(ENC_KEY, AES_KEYLEN);
+    char *mhex = bin2hex(MAC_KEY, HMAC_KEYLEN);
+    printf("Encryption Key (hex): %s\nMAC Key (hex):        %s\n", ehex, mhex);
+    free(ehex); free(mhex);
+    int sock = -1;
+    if (mode_server) {
+        int listenfd = socket(AF_INET, SOCK_STREAM, 0);
+        if (listenfd < 0) { perror("socket"); return 1; }
+        struct sockaddr_in sa; memset(&sa,0,sizeof(sa));
+        sa.sin_family = AF_INET; sa.sin_addr.s_addr = INADDR_ANY; sa.sin_port = htons(port);
+        int opt=1; setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+        if (bind(listenfd, (struct sockaddr*)&sa, sizeof(sa)) < 0) { perror("bind"); return 1; }
+        if (listen(listenfd, 1) < 0) { perror("listen"); return 1; }
+        printf("Waiting for connection on port %d ...\n", port);
+        struct sockaddr_in cli; socklen_t clilen = sizeof(cli);
+        sock = accept(listenfd, (struct sockaddr*)&cli, &clilen);
+        if (sock < 0) { perror("accept"); return 1; }
+        printf("Peer connected.\n"); close(listenfd);
+    } else {
+        sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock < 0) { perror("socket"); return 1; }
+        struct sockaddr_in sa; memset(&sa,0,sizeof(sa));
+        sa.sin_family = AF_INET; sa.sin_port = htons(port);
+        if (inet_pton(AF_INET, host, &sa.sin_addr) != 1) { perror("inet_pton"); return 1; }
+        printf("Connecting to %s:%d ...\n", host, port);
+        if (connect(sock, (struct sockaddr*)&sa, sizeof(sa)) < 0) { perror("connect"); return 1; }
+        printf("Connected to server.\n");
+    }
+    thrarg_t targ = {.sock = sock};
+    pthread_t rthr, sthr;
+    if (pthread_create(&rthr, NULL, receiver_thread, &targ) != 0) { perror("pthread_create"); return 1; }
+    if (pthread_create(&sthr, NULL, sender_thread, &targ) != 0) { perror("pthread_create"); return 1; }
+    pthread_join(rthr, NULL);
+    pthread_join(sthr, NULL);
+    close(sock);
+    return 0;
+}	// Function: main
+// Purpose: Program entry point and orchestration
+// Handles three modes: key generation, server, and client
+// Parses command line arguments and validates keys
+// Sets up network connections (server listens, client connects)
+// Creates sender and receiver threads for concurrent chat
+// Waits for threads to complete before exiting
